@@ -56,7 +56,7 @@ print("Label min/max:", float(np.nanmin(label)), float(np.nanmax(label)))
 #Build rgb image
 
 rgb = image[:3].astype(np.float32)
-rgb = np.transpose(rgb, (1,2,0))
+rgb = np.transpose(rgb, (1,2,0)) #use numpy to complete matrix operations
 
 #Display
 rgb_disp = rgb.copy() # normalize the RGB for better display
@@ -76,12 +76,12 @@ plt.title("RGB")
 plt.axis("off")
 
 plt.subplot(1,3,2)
-plt.imshow(image[0], cmap="gray")
+plt.imshow(image[0], cmap="gray")  #can use gray or viridris, should use viridis as it is more modern
 plt.title("Band 1")
 plt.axis("off")
 
 plt.subplot(1,3,3)
-im = plt.imshow(label, cmap="viridis")
+im = plt.imshow(label, cmap="gray") #sme here
 plt.title("NDVI Label")
 plt.colorbar(im, fraction=0.046, pad=0.04)
 plt.axis("off")
