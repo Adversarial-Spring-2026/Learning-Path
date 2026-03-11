@@ -9,13 +9,20 @@ images1 = os.listdir(folder1)
 images2 = os.listdir(folder2)
 
 min_length = min(len(images1), len(images2))
-images1 = images1[:min_length]
-images2 = images2[:min_length]
+# images1 = images1[:min_length]
+# images2 = images2[:min_length]
 
 index = 0
 
 fig, axes = plt.subplots(1, 2, figsize=(10, 5))
 plt.subplots_adjust(bottom=0.2)
+
+def compare_images():
+    if len(images1) != len(images2):
+        print("Missing labels") if min_length == len(images1) else print("Missing samples")
+
+    for i in range(len(images1)):
+        print(images1[i].replace("ndvi", "") == images2[i].replace("img", ""))
 
 def show_images():
     axes[0].clear()
@@ -52,5 +59,6 @@ def on_key(event):
 
 fig.canvas.mpl_connect("key_press_event", on_key)
 
+compare_images()
 show_images()
 plt.show()
