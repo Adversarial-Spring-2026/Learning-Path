@@ -27,7 +27,7 @@ def data_quality_control():
             issues_found += 1
             continue
 
-        #Verify both image and label reolution
+        #Verify both image and label resolution
         img_path = os.path.join(IMAGE_DIR, image_filename)
         with rasterio.open(img_path) as src:
             img_meta = src.meta
