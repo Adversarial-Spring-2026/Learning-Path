@@ -19,7 +19,7 @@ def compare_labels_and_samples():
         short_sample = [filename.replace('_img_', '_') for filename in samples]
         if len(labels) > len(samples):
             print("Missing the following samples:")
-            missing = set(short_sample).difference(set(short_sample))
+            missing = set(short_label).difference(set(short_sample))
             return missing
         if len(labels) < len(samples):
             print("Missing the following labels:")
