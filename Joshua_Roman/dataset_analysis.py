@@ -3,11 +3,13 @@ import numpy as np
 import rasterio
 import matplotlib.pyplot as plt
 
-IMAGE_DIR = "Learning_Path/samples"
-LABEL_DIR = "Learning_Path/labels"
+base_dir = os.path.dirname(os.path.abspath(__file__))
+
+# Construct absolute paths for the image and label directories
+IMAGE_DIR = os.path.join(base_dir, "../samples")
+LABEL_DIR = os.path.join(base_dir, "../labels")
 
 image_files = sorted(os.listdir(IMAGE_DIR))
-
 print(f"Total images found: {len(image_files)}")
 
 def data_quality_control():
@@ -64,6 +66,32 @@ def load_pair(image_filename):
         ndvi = src.read(1).astype("float32")
 
     return rgb, ndvi
+
+#Loads entire dataset
+def load_dataset():
+    X=[]
+    y=[]
+    for image_file in image_files:
+        rgb, ndvi = load_pair(image_file)
+
+        #Extract RGB features
+        features = []
+        for band in range(3):
+            channel = rgb[:,:,band]
+            features.append(np.mean(channel))
+            features.append(np.std(channel))
+        
+        #Convert NDVI -> label
+        label = 0
+        mean_ndvi = np.mean(ndvi)
+        if 2*(mean_ndvi/230)-1 > 0.5:
+            label = 1
+        
+        X.append(np.array(features))
+        y.append(label)
+
+    return np.array(X), np.array(y)
+
 
 #Visualize sample-label pairs together and mean NDVI indicator
 def sample_viewer():
