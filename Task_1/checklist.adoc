@@ -1,0 +1,52 @@
+= Dataset Exploration & Preprocessing  Checklist Answers
+
+== Dataset & Remote Sensing Basics
+* *What is Sentinel-2 imagery and why multiple bands?*  
+Sentinel-2 imagery comes from satellites and captures Earth from space. It has multiple bands because it records different types of light (not just RGB), which helps identify vegetation, water, and soil more accurately.
+* *Difference between RGB and multi-band image?*  
+An RGB image has 3 channels (red, green, blue). A multi-band image has many channels, each capturing different information like infrared or other wavelengths.
+* *Why use NDVI instead of RGB?*  
+NDVI is better for measuring vegetation health. RGB images cannot clearly show how healthy plants or vegetation are.
+
+== Data Exploration
+* *What differences did you notice across bands?*  
+Different bands highlight different features. Some show vegetation more clearly, while others highlight water or soil.
+* *How are labels structured?*  
+In the labels each pixel has a value (NDVI) corresponding to the input image.
+* *What if image and label don’t match?*  
+The model will learn incorrect relationships, leading to poor predictions.
+
+== Data Characteristics
+* *What is resolution and why important?*  
+Resolution is the size and detail of an image (in this case the images and label have 256×256). Higher resolution provides more detail, improving the analysis.
+* *How does metadata affect model performance?*  
+Metadata like date or sensor type can change lighting, season, or image quality, which affects how the model learns.
+* *Problems with missing or noisy data?*  
+Missing or noisy data can confuse the model and reduce accuracy.
+
+== Preprocessing
+* *Why normalize images?*  
+Normalization scales values to a standard range, helping the model learn more efficiently.
+* *Min-max vs standardization?*  
+Min-max normalization scales values between 0 and 1.  
+Standardization centers data around 0 using mean and standard deviation.
+* *Why encode labels as numbers?*  
+Machine learning models only understand numerical data.
+* *Effect of resizing images?*  
+Smaller images reduce computation time but may lose important details.
+
+== Machine Learning Fundamentals
+* *Features vs labels?*  
+Features are the inputs (images).  
+Labels are the outputs (NDVI values).
+* *Why split data?*  
+To evaluate how well the model performs on unseen data.
+* *Classification vs regression?*  
+Classification predicts categories.  
+Regression predicts continuous values like NDVI.
+* *Problem with imbalanced dataset?*  
+The model becomes biased toward the most common class.
+* *How to check if model is learning vs memorizing?*  
+Test it on new data. Good performance means learning; poor performance means memorizing.
+* *Overfitting with high-resolution images?*  
+The model may memorize details instead of learning patterns, reducing performance on new data.
