@@ -10,8 +10,8 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
-SAMPLES = "/Users/m4fanta/projects/uprm-projects/research/pandahat-adversarial/Learning-Path/samples"   # directory containing RGB .tiff images
-LABELS  = "/Users/m4fanta/projects/uprm-projects/research/pandahat-adversarial/Learning-Path/labels"    # directory containing NDVI .tiff images
+SAMPLES = ".../samples"   # directory containing RGB .tiff images (add your own path)
+LABELS  = ".../labels"    # directory containing NDVI .tiff images (add your own path)
 PATCH   = 16           # pixel width/height of each sampled patch (16x16)
 THR     = 0.3          # NDVI threshold above which a pixel is considered vegetation
 N       = 2000         # number of random patches sampled per image
@@ -87,7 +87,7 @@ X_tr, y_tr = build_tensors(train_pairs)
 X_val, y_val = build_tensors(val_pairs)
 X_te, y_te = build_tensors(test_pairs)
 
-# --- Weighted loss instead of oversampling: handles imbalance without duplicating data ---
+# --- Weighted loss instead of oversampling: handles imbalance without duplicating data 
 n_veg     = (y_tr == 1).sum().float()
 n_nonveg  = (y_tr == 0).sum().float()
 weights   = torch.tensor([n_veg / (n_veg + n_nonveg), n_nonveg / (n_veg + n_nonveg)])
@@ -142,9 +142,9 @@ print(f"  Precision {prec*100:.2f}%")
 print(f"  Recall    {rec*100:.2f}%")
 print(classification_report(true, preds, target_names=["Non-Veg", "Veg"]))
 
-# =============================================================================
+
 # FIGURE 1 — Learning curves (train vs val so fluctuation is visible)
-# =============================================================================
+
 epochs = range(1, EPOCHS + 1)
 fig, axes = plt.subplots(2, 2, figsize=(13, 8))
 fig.suptitle("Training History — Train (solid) vs Validation (dashed)", fontsize=13)
@@ -169,9 +169,9 @@ plt.tight_layout()
 plt.savefig("learning_curves.png", dpi=150)
 plt.show()
 
-# =============================================================================
+
 # FIGURE 2 — Test evaluation (bar chart + confusion matrix)
-# =============================================================================
+
 cm = confusion_matrix(true, preds)
 tn, fp, fn, tp = cm.ravel()
 
@@ -204,11 +204,10 @@ plt.tight_layout()
 plt.savefig("test_evaluation.png", dpi=150)
 plt.show()
 
-# =============================================================================
 # FIGURE 3 — Vegetation overlay on a real test image
 # Scans the full image pixel-by-pixel (striding by PATCH//2) and overlays
 # a green mask wherever the model predicts vegetation.
-# =============================================================================
+
 def predict_image(model, img_path):
     """Return the RGB array and a boolean mask of model-predicted vegetation."""
     rgb_raw = np.array(Image.open(img_path)).astype(np.float32)
