@@ -72,8 +72,8 @@ from sklearn.metrics import (               # scikit-learn metrics — same libr
 
 CONFIG = {
     # --- Paths ---
-    "samples_dir"     : "samples/",        # folder containing RGB satellite images
-    "labels_dir"      : "labels/",         # folder containing grayscale NDVI masks
+    "samples_dir"     : "/samples",        # folder containing RGB satellite images
+    "labels_dir"      : "/labels",         # folder containing grayscale NDVI masks
 
     # --- Image settings ---
     "image_size"      : (128, 128),         # resize all images to this (H, W) before training (normal, 256 256)
@@ -118,7 +118,7 @@ CONFIG = {
     "weight_decay"    : 1e-5,              # L2 regularisation — penalises large weights to prevent overfitting
 
     # --- Augmentation toggles ---
-    "use_augmentation": True,               # set False to disable all augmentation (useful for debugging)
+    "use_augmentation": False,               # set False to disable all augmentation (useful for debugging)
 
     # --- Reproducibility ---
     "seed"            : 42,                 # fix this so results are reproducible across runs
@@ -720,7 +720,7 @@ class Preprocessing:
 #       ↓ Encoder Block 1  → features: (32, 128, 128)   ─────────────────┐ skip
 #       ↓ Encoder Block 2  → features: (64, 64, 64)     ───────────────┐ │ skip
 #       ↓ Encoder Block 3  → features: (128, 32, 32)    ─────────────┐ │ │ skip
-#       ↓ Bottleneck       → features: (256, 16, 16)                  │ │ │
+#       ↓ Bottleneck       → features: (256, 16, 16)                 │ │ │
 #       ↑ Decoder Block 3  → features: (128, 32, 32)  ←──────────────┘ │ │
 #       ↑ Decoder Block 2  → features: (64, 64, 64)   ←────────────────┘ │
 #       ↑ Decoder Block 1  → features: (32, 128, 128) ←──────────────────┘
