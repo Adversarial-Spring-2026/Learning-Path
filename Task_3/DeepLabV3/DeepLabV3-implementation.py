@@ -196,7 +196,7 @@ def train(samples_dir, labels_dir, epochs=20, batch_size=4, lr=1e-4,
     its best so far on validation, we save it.
 
     One detail worth knowing: errors are weighted on non-vegetation pixels
-    more heavily (5x) than vegetation pixels. I tried the reverse approach 
+    more heavily (18x) than vegetation pixels. I tried the reverse approach 
     first and it resulted in a vegetation bias where the model would just 
     predict "vegetation" everywhere and return the image covered entirely 
     in a green overlay(detections). If a dataset is used that has the opposite 
