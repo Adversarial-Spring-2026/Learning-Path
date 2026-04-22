@@ -22,7 +22,7 @@ ARCHITECTURE OVERVIEW:
     └─────────────────────────────────────────────────────────────┘
 
 DEPENDENCIES:
-    pip install torch torchvision tifffile numpy pillow scikit-learn matplotlib time
+    pip install torch torchvision tifffile numpy pillow scikit-learn matplotlib time optuna
 =============================================================================
 
 Done by Claude
@@ -53,6 +53,10 @@ import numpy as np                          # numerical operations on arrays
 from PIL import Image                       # Pillow — used to load .tiff image files
 import tifffile                             # better .tiff support for scientific imagery (float32, 16-bit, etc.)
 import matplotlib.pyplot as plt             # for visualizing images and training curves
+
+import optuna                               # Hyperparameter search for model with optuna
+from optuna.trial import TrialState         # Use to train the model searching for optimal parameters
+import plotly                               # Vizualize optimazation
 
 from sklearn.metrics import (               # scikit-learn metrics — same library used for SVM evaluation
     accuracy_score,                         # overall correctness
@@ -95,8 +99,9 @@ CONFIG = {
     # --- Training hyperparameters ---
     "batch_size"      : 4,
     "epochs"          : 50,
-    "learning_rate"   : 1e-4,
-    "weight_decay"    : 1e-5,
+    "learning_rate"   : 6.800771524467107e-05,
+    "weight_decay"    : 0.00014950598847295672,
+    "dropout_p"       : 0.3651151294305877,
  
     # ─────────────────────────────────────────────────────────────────────────
     # AUGMENTATION PARAMETERS
@@ -837,10 +842,217 @@ class Preprocessing:
 
 
 # =============================================================================
-# CLASS 4: CNN model
+# CLASS 4: VegetationModel  (the actual neural network)
 # =============================================================================
+# Architecture: a simplified U-Net style encoder-decoder.
+#
+# WHY U-NET FOR SEGMENTATION?
+# A regular CNN compresses the image into a small feature map (good for understanding
+# WHAT is in the image) but loses spatial detail (bad for knowing WHERE exactly).
+# U-Net fixes this by having a decoder that upsamples back to the original size,
+# while "skip connections" bring fine spatial detail from the encoder directly
+# to the decoder. The result: each output pixel gets a class prediction.
+#
+#   Input Image (3, 256, 256)
+#       ↓ Encoder Block 1  → features: (32, 128, 128)   ─────────────────┐ skip
+#       ↓ Encoder Block 2  → features: (64, 64, 64)     ───────────────┐ │ skip
+#       ↓ Encoder Block 3  → features: (128, 32, 32)    ─────────────┐ │ │ skip
+#       ↓ Bottleneck       → features: (256, 16, 16)                 │ │ │
+#       ↑ Decoder Block 3  → features: (128, 32, 32)  ←──────────────┘ │ │
+#       ↑ Decoder Block 2  → features: (64, 64, 64)   ←────────────────┘ │
+#       ↑ Decoder Block 1  → features: (32, 128, 128) ←──────────────────┘
+#       ↓ Output Head      → (num_classes, 256, 256)   ← one score per class per pixel
 
-# TODO: Create and fine-tune cnn model
+# ─────────────────────────────────────────────────────────────────────────────
+# Sub-module: DoubleConvBlock
+# ─────────────────────────────────────────────────────────────────────────────
+# This is the fundamental building block used in every encoder and decoder step.
+# It applies two consecutive convolution operations, each followed by
+# Batch Normalisation and ReLU activation.
+
+class DoubleConvBlock(nn.Module):
+    """
+    Two Conv2d layers, each followed by BatchNorm2d and ReLU.
+    Optionally inserts Dropout2d between the two conv pairs.
+ 
+    dropout_p = 0.0  → no dropout (default, used in encoder + decoder)
+    dropout_p > 0.0  → dropout active (used only in the bottleneck)
+ 
+    WHY DROPOUT2D IN THE BOTTLENECK ONLY?
+    At the bottleneck the feature map is the most spatially compressed —
+    e.g. 8×8 for a 128×128 input. Each channel here represents a highly
+    abstract, global concept. Randomly zeroing entire channels forces the
+    network to not over-rely on any single abstraction, which reduces
+    overfitting. In the encoder/decoder, features are spatially rich and
+    still learning low-level patterns; disrupting them there just hurts
+    convergence without the same regularisation benefit.
+    """
+ 
+    def __init__(self, in_channels: int, out_channels: int, dropout_p: float = 0.0):
+        super().__init__()
+ 
+        # Build the layer sequence dynamically based on whether dropout is needed
+        layers = [
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+        ]
+ 
+        # Insert Dropout2d BETWEEN the two conv pairs, if requested.
+        # Dropout2d zeros entire channels (not individual neurons) — correct
+        # for feature maps where adjacent pixels are spatially correlated.
+        if dropout_p > 0.0:
+            layers.append(nn.Dropout2d(p=dropout_p))
+ 
+        layers += [
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+        ]
+ 
+        self.block = nn.Sequential(*layers)
+ 
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.block(x)
+ 
+ 
+# =============================================================================
+# Sub-module: EncoderBlock  (unchanged — listed here for completeness)
+# =============================================================================
+ 
+class EncoderBlock(nn.Module):
+    """
+    One step DOWN in the encoder (left side of the U).
+ 
+    Steps:
+        1. DoubleConvBlock → learns features at the current scale
+        2. MaxPool2d(2,2)  → halves H and W (downsampling / compression)
+ 
+    Returns both the pooled output (for the next encoder level) and the
+    pre-pool features (saved as skip connection for the decoder).
+    """
+ 
+    def __init__(self, in_channels: int, out_channels: int):
+        super().__init__()
+        # dropout_p defaults to 0.0 here — encoder blocks never use dropout
+        self.conv = DoubleConvBlock(in_channels, out_channels, dropout_p=0.0)
+        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
+ 
+    def forward(self, x: torch.Tensor):
+        features = self.conv(x)        # high-resolution features — saved as skip
+        pooled   = self.pool(features) # compressed spatial representation
+        return pooled, features
+ 
+ 
+# =============================================================================
+# Sub-module: DecoderBlock  (unchanged — listed here for completeness)
+# =============================================================================
+ 
+class DecoderBlock(nn.Module):
+    """
+    One step UP in the decoder (right side of the U).
+ 
+    Steps:
+        1. ConvTranspose2d → doubles H and W (learnable upsampling)
+        2. Concatenate with skip connection from the matching encoder layer
+        3. DoubleConvBlock → refine combined features
+    """
+ 
+    def __init__(self, in_channels: int, out_channels: int):
+        super().__init__()
+        self.upsample = nn.ConvTranspose2d(in_channels, out_channels,
+                                           kernel_size=2, stride=2)
+        # dropout_p = 0.0 in the decoder — regularisation isn't needed here
+        self.conv = DoubleConvBlock(out_channels * 2, out_channels, dropout_p=0.0)
+ 
+    def forward(self, x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
+        x = self.upsample(x)
+ 
+        # Guard against off-by-one size mismatches when input isn't a power of 2
+        if x.shape != skip.shape:
+            skip = skip[:, :, :x.shape[2], :x.shape[3]]
+ 
+        x = torch.cat([x, skip], dim=1)   # combine upsampled + skip-connection features
+        return self.conv(x)
+ 
+ 
+# =============================================================================
+# The full model
+# =============================================================================
+class VegetationModel(nn.Module):
+    """
+    U-Net style encoder-decoder for pixel-wise vegetation classification.
+ 
+    Input:  (B, 3, H, W)              — batch of RGB images
+    Output: (B, num_classes, H, W)    — per-pixel class scores (raw logits)
+ 
+    The ONLY change from the previous version is the addition of `dropout_p`.
+    Everything else — encoder blocks, skip connections, decoder, output head —
+    is identical to the model that gave you better results.
+ 
+    dropout_p is forwarded exclusively to the bottleneck DoubleConvBlock.
+    Encoder and decoder blocks always receive dropout_p=0.0.
+    """
+ 
+    def __init__(self, in_channels: int = 3, num_classes: int = 4,
+                 features: list = None, dropout_p: float = 0.3):
+        """
+        Args:
+            in_channels : number of input channels (3 for RGB)
+            num_classes : number of vegetation classes to predict
+            features    : channel counts at each encoder level.
+                          Default [32, 64, 128, 256] → 4-level U-Net.
+            dropout_p   : dropout probability in the BOTTLENECK only.
+                          0.0  = no dropout (no regularisation at bottleneck)
+                          0.3  = 30% of bottleneck channels zeroed per step
+                          HPOptimizer will search this in [0.1, 0.5].
+        """
+        super().__init__()
+ 
+        if features is None:
+            features = [32, 64, 128, 256]
+ 
+        # ── Encoder ──────────────────────────────────────────────────────────
+        self.encoders = nn.ModuleList()
+        prev_channels = in_channels
+        for feat in features[:-1]:   # all but last level → encoder blocks
+            self.encoders.append(EncoderBlock(prev_channels, feat))
+            prev_channels = feat
+ 
+        # ── Bottleneck ────────────────────────────────────────────────────────
+        # THIS is the only block that receives dropout_p.
+        # features[-2] → features[-1], e.g. 128 → 256 for default features list.
+        self.bottleneck = DoubleConvBlock(features[-2], features[-1],
+                                          dropout_p=dropout_p)  # ← the fix
+ 
+        # ── Decoder ───────────────────────────────────────────────────────────
+        self.decoders = nn.ModuleList()
+        reversed_features = list(reversed(features))
+        for i in range(len(reversed_features) - 1):
+            self.decoders.append(
+                DecoderBlock(reversed_features[i], reversed_features[i + 1])
+            )
+ 
+        # ── Output head ───────────────────────────────────────────────────────
+        self.output_conv = nn.Conv2d(features[0], num_classes, kernel_size=1)
+ 
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        skip_connections = []
+ 
+        # Encoder: compress and store skip maps
+        for encoder in self.encoders:
+            x, skip = encoder(x)
+            skip_connections.append(skip)
+ 
+        # Bottleneck: most abstract representation (dropout active during training)
+        x = self.bottleneck(x)
+ 
+        # Decoder: expand and inject skips in reverse order
+        for decoder, skip in zip(self.decoders, reversed(skip_connections)):
+            x = decoder(x, skip)
+ 
+        return self.output_conv(x)
+
 
 # =============================================================================
 # CLASS 4b: AugmentationInspector
@@ -1078,6 +1290,278 @@ class AugmentationInspector:
         print("[Inspector] Check: do the image and mask share the exact same "
               "orientation, zoom, and position? They must.")
         
+
+# =============================================================================
+# CLASS 4c: HPOptimizer  — Hyperparameter Search with Optuna
+# =============================================================================
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# WHAT IS HYPERPARAMETER OPTIMISATION?
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# There are two kinds of "parameters" in a deep learning model:
+#
+#   Regular parameters:  the weights inside Conv2d, BatchNorm, etc.
+#       → Learned AUTOMATICALLY by gradient descent during training.
+#
+#   Hyperparameters: the settings YOU choose before training starts.
+#       → Learning rate, batch size, dropout probability, number of features,
+#         weight decay, data augmentation probabilities, etc.
+#       → These CANNOT be learned by gradient descent because they define
+#         the structure of the problem, not the weights within it.
+#
+# The challenge: the performance of your model depends heavily on
+# hyperparameters, but there's no mathematical formula to find the best ones.
+# You have to try different combinations and see what works.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# WHY OPTUNA INSTEAD OF GRID SEARCH?
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Grid search: exhaustively tries every combination.
+#   With 5 hyperparameters × 5 values each = 5^5 = 3125 training runs. Unusable.
+#
+# Random search: randomly samples combinations.
+#   Better — but wastes compute on bad regions of parameter space.
+#
+# Optuna (Bayesian optimisation with TPE):
+#   Builds a probabilistic MODEL of which hyperparameter regions produce
+#   good results, then GUIDES the search toward promising regions.
+#   It tries combinations that are likely to be better than what it has
+#   seen so far, based on what it has learned. Much more efficient.
+#
+#   Additionally, Optuna supports PRUNING: if a trial is clearly going to
+#   be bad (val loss not improving after a few epochs), Optuna stops it
+#   early and moves on. This saves huge amounts of compute.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# WHAT WE'RE SEARCHING OVER
+# ─────────────────────────────────────────────────────────────────────────────
+#
+#   learning_rate  : the single most important hyperparameter. Too high →
+#                    training diverges. Too low → training is painfully slow.
+#                    We search log-uniformly (1e-5 to 1e-2) because good
+#                    values span several orders of magnitude.
+#
+#   weight_decay   : L2 regularisation strength. Penalises large weights to
+#                    prevent overfitting. Same log-uniform search.
+#
+#   dropout_p      : bottleneck dropout probability. Higher → more regularisation
+#                    but slower convergence. Search in [0.1, 0.5].
+#
+#   features_level : which feature width set to use.
+#                    "small"  [16, 32, 64, 128]  → fast, fewer params
+#                    "medium" [32, 64, 128, 256]  → default, balanced
+#                    "large"  [64, 128, 256, 512] → slow, more capacity
+#
+#   batch_size     : affects gradient noise (smaller = noisier but better
+#                    generalisation in some cases) and training speed.
+#
+# INSTALL:  pip install optuna
+# ─────────────────────────────────────────────────────────────────────────────
+
+class HPOptimizer:
+    """
+    Hyperparameter search for VegetationModel using Optuna.
+
+    Usage (in main, BEFORE the full training run):
+        optimizer = HPOptimizer(full_dataset, CONFIG, n_trials=20, epochs_per_trial=10)
+        best_params = optimizer.run()
+        # Update CONFIG with best_params, then do the full training run.
+
+    Each "trial" is a short training run (e.g. 10 epochs) with one
+    hyperparameter configuration. Optuna observes all trial results and
+    proposes increasingly better configurations.
+    """
+
+    def __init__(self, dataset, config: dict,
+                 n_trials: int = 20,
+                 epochs_per_trial: int = 10):
+        """
+        Args:
+            dataset         : the full VegetationDataset instance
+            config          : the global CONFIG dict (used for fixed settings)
+            n_trials        : how many hyperparameter combinations to try.
+                              20–50 is practical. More → better search but more compute.
+            epochs_per_trial: how many epochs to train each trial.
+                              Short (10–15) is enough to distinguish good from bad configs.
+                              Full training happens AFTER the search with the best config.
+        """
+        self.dataset          = dataset
+        self.config           = config
+        self.n_trials         = n_trials
+        self.epochs_per_trial = epochs_per_trial
+        self.device           = config["device"]
+
+    # -------------------------------------------------------------------------
+    def _build_loaders(self, batch_size: int):
+        """
+        Builds train/val DataLoaders for a given batch size.
+        Uses the same 70/15 split as the main pipeline.
+        """
+        total   = len(self.dataset)
+        n_train = int(total * self.config["train_ratio"])
+        n_val   = int(total * self.config["val_ratio"])
+        n_rest  = total - n_train - n_val
+
+        train_set, val_set, _ = torch.utils.data.random_split(
+            self.dataset, [n_train, n_val, n_rest],
+            generator=torch.Generator().manual_seed(self.config["seed"])
+        )
+
+        train_loader = DataLoader(train_set, batch_size=batch_size,
+                                  shuffle=True,  num_workers=2, pin_memory=True)
+        val_loader   = DataLoader(val_set,   batch_size=batch_size,
+                                  shuffle=False, num_workers=2, pin_memory=True)
+        return train_loader, val_loader
+
+    # -------------------------------------------------------------------------
+    def _objective(self, trial: optuna.Trial) -> float:
+        """
+        Optuna calls this function for each trial with a new suggested config.
+        Returns the validation loss after a short training run.
+        Optuna will minimise this value across all trials.
+        """
+
+        # ── Suggest hyperparameters ───────────────────────────────────────────
+        # trial.suggest_*() both draws a value AND logs it for analysis.
+
+        lr = trial.suggest_float("learning_rate", 1e-5, 1e-2, log=True)
+        # log=True: samples uniformly on the LOG scale → equally likely to
+        # suggest 1e-5 as 1e-4 as 1e-3. Without log=True, almost all samples
+        # would be near 1e-2 (the large end of the range).
+
+        wd = trial.suggest_float("weight_decay", 1e-6, 1e-3, log=True)
+
+        dropout_p = trial.suggest_float("dropout_p", 0.1, 0.5)
+
+        features_choice = trial.suggest_categorical(
+            "features_level", ["small", "medium", "large"]
+        )
+        feature_map = {
+            "small":  [16,  32,  64,  128],
+            "medium": [32,  64,  128, 256],
+            "large":  [64,  128, 256, 512],
+        }
+        features = feature_map[features_choice]
+
+        batch_size = trial.suggest_categorical("batch_size", [2, 4, 8])
+
+        # ── Build model & loaders for this trial ─────────────────────────────
+        model = VegetationModel(
+            in_channels  = 3,
+            num_classes  = self.config["num_classes"],
+            features     = features,
+            dropout_p    = dropout_p,
+        ).to(self.device)
+
+        train_loader, val_loader = self._build_loaders(batch_size)
+
+        optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=wd)
+        # Mirror the same weights inside the HP search so Optuna optimises the right objective
+        raw_w  = torch.tensor([1/0.91, 1/0.71, 1/0.70, 1/0.85], dtype=torch.float32).to(self.device)
+        w      = raw_w / raw_w.sum() * self.config["num_classes"]
+        loss_fn = nn.CrossEntropyLoss(weight=w, label_smoothing=0.1)
+
+        # ── Short training run ────────────────────────────────────────────────
+        best_val_loss = float("inf")
+
+        for epoch in range(1, self.epochs_per_trial + 1):
+
+            # ── Train ─────────────────────────────────────────────────────────
+            model.train()
+            for images, labels in train_loader:
+                images, labels = images.to(self.device), labels.to(self.device)
+                preds = model(images)
+                loss  = loss_fn(preds, labels)
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+
+            # ── Validate ──────────────────────────────────────────────────────
+            model.eval()
+            total_val = 0.0
+            with torch.no_grad():
+                for images, labels in val_loader:
+                    images, labels = images.to(self.device), labels.to(self.device)
+                    preds      = model(images)
+                    total_val += loss_fn(preds, labels).item()
+            val_loss = total_val / len(val_loader)
+
+            best_val_loss = min(best_val_loss, val_loss)
+
+            # ── Report to Optuna (enables pruning) ────────────────────────────
+            # Pruning: Optuna checks if this trial is already clearly worse
+            # than the current best. If so, it raises TrialPruned and we
+            # skip the remaining epochs — saving compute.
+            trial.report(val_loss, epoch)
+            if trial.should_prune():
+                raise optuna.exceptions.TrialPruned()
+
+        return best_val_loss
+
+    # -------------------------------------------------------------------------
+    def run(self) -> dict:
+        """
+        Runs the full hyperparameter search.
+
+        Returns:
+            best_params : dict of the best hyperparameter values found.
+                          Copy the relevant values into CONFIG before training.
+        """
+        print(f"\n[HPOptimizer] Starting search: {self.n_trials} trials × "
+              f"{self.epochs_per_trial} epochs each")
+        print(f"              Device: {self.device}")
+        print(f"              Estimated wall time (rough): "
+              f"~{self.n_trials * self.epochs_per_trial} epoch-equivalents\n")
+
+        # Create an Optuna study.
+        #   direction='minimize' : we want LOWER validation loss.
+        #   pruner: MedianPruner stops a trial if its val_loss at epoch N is
+        #     worse than the median val_loss at epoch N across all completed trials.
+        study = optuna.create_study(
+            direction = "minimize",
+            pruner    = optuna.pruners.MedianPruner(
+                n_startup_trials  = 5,    # don't prune until 5 trials are done
+                n_warmup_steps    = 3,    # don't prune in the first 3 epochs
+            ),
+            sampler   = optuna.samplers.TPESampler(seed=self.config["seed"]),
+            # TPE (Tree-structured Parzen Estimator) is the Bayesian search algorithm.
+            # It builds a model of which hyperparameter values led to good/bad results,
+            # and samples new candidates from the "good" region.
+        )
+
+        print("Start optimaze")
+        study.optimize(self._objective, n_trials=self.n_trials,
+                       show_progress_bar=True)
+        print("End optimaze")
+
+        # ── Summary ───────────────────────────────────────────────────────────
+        pruned   = len(study.get_trials(deepcopy=False, states=[TrialState.PRUNED]))
+        complete = len(study.get_trials(deepcopy=False, states=[TrialState.COMPLETE]))
+
+        print(f"\n[HPOptimizer] Search complete.")
+        print(f"  Completed trials : {complete}")
+        print(f"  Pruned trials    : {pruned}  (stopped early — saved compute)")
+        print(f"  Best val loss    : {study.best_value:.4f}")
+        print(f"\n  ★ Best hyperparameters found:")
+        for k, v in study.best_params.items():
+            print(f"      {k:20s} = {v}")
+
+        print("\n  → Copy these into CONFIG (or use the dict returned by run())")
+        print("    then run the FULL training with all epochs.")
+
+        # Optionally visualise the search (requires plotly: pip install plotly)
+        try:
+            fig = optuna.visualization.plot_param_importances(study)
+            fig.write_image("hp_importance.png")
+            print("\n  [HPOptimizer] Parameter importance chart saved as 'hp_importance.png'")
+        except Exception:
+            pass   # plotly not installed — skip silently
+
+        return study.best_params
+    
+
 # =============================================================================
 # CLASS 5: Trainer
 # =============================================================================
@@ -1117,9 +1601,19 @@ class Trainer:
         # Internally: it applies LogSoftmax + NLLLoss.
         # Input:  (B, num_classes, H, W) raw logits + (B, H, W) int64 class indices
         # Output: a single scalar loss value
-        self.loss_fn = nn.CrossEntropyLoss()
-        # TODO: if your classes are imbalanced, pass weight=class_weights to CrossEntropyLoss
-        #       class_weights = torch.tensor([w0, w1, w2]) where wi = 1/frequency_of_class_i
+        # --- Loss function with class weights ---
+        # Weights are INVERSE of F1 score — classes the model struggles with get penalised more.
+        # Your F1s: Non-veg=0.91, Low=0.71, Moderate=0.70, Dense=0.85
+        # Formula: weight_i = 1 / f1_i, then normalised so they sum to num_classes.
+        raw_weights = torch.tensor([1/0.91, 1/0.71, 1/0.70, 1/0.85], dtype=torch.float32)
+        class_weights = (raw_weights / raw_weights.sum() * config["num_classes"]).to(self.device)
+
+        self.loss_fn = nn.CrossEntropyLoss(
+            weight        = class_weights,  # penalise Low/Moderate mistakes ~30% more
+            label_smoothing = 0.1           # spreads 10% of confidence to other classes —
+                                            # stops the model being overconfident at the
+                                            # NDVI 0.3/0.6 boundary where classes bleed into each other
+        )
 
         # --- Optimizer ---
         # Adam is the most commonly used optimizer. It adapts the learning rate
@@ -1563,13 +2057,13 @@ def main():
     # Two plots are saved:
     #   augmentation_grid.png       → one image, 8 random augmented versions
     #   augmentation_comparison.png → original vs augmented, image + mask side by side
-    if augmentation is not None:
-        print("\n[2.5] Inspecting augmentation output...")
-        inspector = AugmentationInspector(full_dataset, augmentation)
-        inspector.show_augmentation_grid(idx=0, n_versions=8)
-        inspector.show_original_vs_augmented(idx=0)
-    else:
-        print("\n[2.5] Augmentation is OFF — skipping visual inspection.")
+    # if augmentation is not None:
+    #     print("\n[2.5] Inspecting augmentation output...")
+    #     inspector = AugmentationInspector(full_dataset, augmentation)
+    #     inspector.show_augmentation_grid(idx=0, n_versions=8)
+    #     inspector.show_original_vs_augmented(idx=0)
+    # else:
+    #     print("\n[2.5] Augmentation is OFF — skipping visual inspection.")
 
     # ── Step 3: Split into train / val / test ────────────────────────────────
     print("\n[3] Splitting data into train / val / test sets...")
@@ -1601,38 +2095,58 @@ def main():
     # pin_memory=True: keeps data in pinned (page-locked) CPU memory for faster GPU transfer.
     # Only useful if device is CUDA. Harmless on CPU.
 
-    # ── Step 5: Build the model ───────────────────────────────────────────────
-    # print("\n[5] Building the model...")
-    # TODO: Create the model instance
-    # print("\n[5] Building the model...")
-    # model = VegetationModel(
-    #     in_channels  = 3,                       # RGB
-    #     num_classes  = CONFIG["num_classes"],
-    #     features     = [32, 64, 128, 256]        # TODO: try [64, 128, 256, 512] for larger model
-    # )
+    # ── Step 5 (optional): Hyperparameter search ──────────────────────────
+    # Run this ONCE to find good hyperparameters.
+    # Comment it out after you have the best_params — it's expensive.
+    #
+    # IMPORTANT: pass the dataset WITHOUT augmentation for the HP search.
+    # Augmentation adds randomness that makes it hard to distinguish a
+    # truly better hyperparameter from a lucky augmentation sample.
+    #
+    # print("\n[5-HP] Running hyperparameter search (this may take a while)...")
+    # hp_opt     = HPOptimizer(full_dataset, CONFIG, n_trials=20, epochs_per_trial=10)
+    # best_params = hp_opt.run()
+    # # Then update CONFIG manually from the printed output, or:
+    # print("Best parameters: ")
+    # print("Learning rate: ", best_params["learning_rate"])
+    # print("Weight Decay: ", best_params["weight_decay"])
+    # print("Batch size: ", best_params["batch_size"])
 
-    # Count and display the number of learnable parameters
-    # n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    # print(f"    Model has {n_params:,} trainable parameters.")
+    # CONFIG["learning_rate"] = best_params["learning_rate"]
+    # CONFIG["weight_decay"]  = best_params["weight_decay"]
+    # CONFIG["batch_size"]    = best_params["batch_size"]
+    # Re-create loaders if batch_size changed
 
-    # ── Step 6: Train ─────────────────────────────────────────────────────────
-    # print("\n[6] Training the model...")
-    # trainer = Trainer(model, train_loader, val_loader, CONFIG)
-    # trainer.train()
-    # trainer.plot_losses()
+    # ── Step 5: Build the model ───────────────────────────────────────────
+    print("\n[5] Building the model...")
+    model = VegetationModel(
+        in_channels  = 3,
+        num_classes  = CONFIG["num_classes"],
+        features     = [32, 64, 128, 256],   # or use best_params["features_level"]
+        dropout_p    = CONFIG["dropout_p"],  # or use best_params["dropout_p"]
+    )
+    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"    Model has {n_params:,} trainable parameters.")
 
-    # ── Step 7: Load the best saved model weights ─────────────────────────────
-    # We always evaluate using the BEST checkpoint (lowest val loss),
-    # not the weights from the final epoch (which may have overfit slightly).
-    # print("\n[7] Loading best model weights for evaluation...")
-    # model.load_state_dict(torch.load(CONFIG["model_save_path"], map_location=CONFIG["device"]))
+    # ── Step 6: Train ─────────────────────────────────────────────────────
+    print("\n[6] Training the model...")
+    trainer = Trainer(model, train_loader, val_loader, CONFIG)
+    trainer.train()
+    print("Ploting lossess...")
+    trainer.plot_losses()
 
-    # ── Step 8: Evaluate on the test set ──────────────────────────────────────
-    # print("\n[8] Evaluating on the held-out test set...")
-    # evaluator = Evaluator(model, test_loader, CONFIG)
-    # metrics   = evaluator.evaluate(
-    #     class_names=["Non-vegetal", "Low Vegetation", "Moderate Vegetation", "Dense Vegetation"]
-    # )
+    # ── Step 7: Load best checkpoint ──────────────────────────────────────
+    print("\n[7] Loading best model weights for evaluation...")
+    model.load_state_dict(torch.load(CONFIG["model_save_path"],
+                                     map_location=CONFIG["device"]))
+
+    # ── Step 8: Evaluate ──────────────────────────────────────────────────
+    print("\n[8] Evaluating on the held-out test set...")
+    evaluator = Evaluator(model, test_loader, CONFIG)
+    metrics   = evaluator.evaluate(
+        class_names=["Non-vegetal", "Low Vegetation",
+                     "Moderate Vegetation", "Dense Vegetation"]
+    )
 
     print("\n[Pipeline complete]")
 
